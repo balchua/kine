@@ -31,7 +31,7 @@ func (t *Tx) Commit() error {
 
 func (t *Tx) MustCommit() {
 	if err := t.Commit(); err != nil {
-		logrus.Fatalf("Transaction commit failed: %v", err)
+		logrus.Errorf("Transaction commit failed: %v", err)
 	}
 }
 
@@ -43,7 +43,7 @@ func (t *Tx) Rollback() error {
 func (t *Tx) MustRollback() {
 	if err := t.Rollback(); err != nil {
 		if err != sql.ErrTxDone {
-			logrus.Fatalf("Transaction rollback failed: %v", err)
+			logrus.Errorf("Transaction rollback failed: %v", err)
 		}
 	}
 }
