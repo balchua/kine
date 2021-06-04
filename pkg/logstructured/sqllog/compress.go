@@ -9,7 +9,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var toCompress = true
+var toCompress = false
 
 func compressGzip(data []byte) []byte {
 
