@@ -510,14 +510,17 @@ func (s *SQLLog) Append(ctx context.Context, event *server.Event) (int64, error)
 		e.PrevKV = &server.KeyValue{}
 	}
 
+	value := compressGzip(e.KV.Value)
+	prevValue := compressGzip(e.PrevKV.Value)
+
 	rev, err := s.d.Insert(ctx, e.KV.Key,
 		e.Create,
 		e.Delete,
 		e.KV.CreateRevision,
 		e.PrevKV.ModRevision,
 		e.KV.Lease,
-		e.KV.Value,
-		e.PrevKV.Value,
+		value,
+		prevValue,
 	)
 	if err != nil {
 		return 0, err
@@ -535,6 +538,11 @@ func scan(rows *sql.Rows, rev *int64, compact *int64, event *server.Event) error
 
 	c := &sql.NullInt64{}
 
+	var (
+		value     []byte
+		prevValue []byte
+	)
+
 	err := rows.Scan(
 		rev,
 		c,
@@ -545,9 +553,13 @@ func scan(rows *sql.Rows, rev *int64, compact *int64, event *server.Event) error
 		&event.KV.CreateRevision,
 		&event.PrevKV.ModRevision,
 		&event.KV.Lease,
-		&event.KV.Value,
-		&event.PrevKV.Value,
+		&value,
+		&prevValue,
 	)
+
+	event.KV.Value = uncompressGzip(value)
+	event.PrevKV.Value = uncompressGzip(prevValue)
+
 	if err != nil {
 		return err
 	}
