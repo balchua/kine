@@ -1,13 +1,13 @@
-module github.com/rancher/kine
+module github.com/k3s-io/kine
 
-go 1.12
+go 1.15
 
 require (
 	github.com/Rican7/retry v0.1.0
 	github.com/canonical/go-dqlite v1.5.1
 	github.com/go-sql-driver/mysql v1.4.1
-	github.com/lib/pq v1.1.1
-	github.com/mattn/go-sqlite3 v1.10.0
+	github.com/lib/pq v1.8.0
+	github.com/mattn/go-sqlite3 v1.14.4
 	github.com/pkg/errors v0.8.1
 	github.com/rancher/wrangler v0.4.0
 	github.com/sirupsen/logrus v1.4.2

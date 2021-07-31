@@ -4,19 +4,26 @@ package dqlite
 
 import (
 	"context"
+	crypto_tls "crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"fmt"
+	"io/ioutil"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/canonical/go-dqlite"
+	"github.com/canonical/go-dqlite/app"
 	"github.com/canonical/go-dqlite/client"
 	"github.com/canonical/go-dqlite/driver"
+	"github.com/k3s-io/kine/pkg/drivers/generic"
+	"github.com/k3s-io/kine/pkg/drivers/sqlite"
+	"github.com/k3s-io/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/tls"
 	"github.com/pkg/errors"
-	"github.com/rancher/kine/pkg/drivers/sqlite"
-	"github.com/rancher/kine/pkg/server"
 	"github.com/sirupsen/logrus"
 )
 
@@ -67,7 +74,7 @@ outer:
 	return nil
 }
 
-func New(ctx context.Context, datasourceName string) (server.Backend, error) {
+func New(ctx context.Context, datasourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig) (server.Backend, error) {
 	opts, err := parseOpts(datasourceName)
 	if err != nil {
 		return nil, err
@@ -89,17 +96,21 @@ func New(ctx context.Context, datasourceName string) (server.Backend, error) {
 
 	if opts.driverName == "" {
 		opts.driverName = "dqlite"
+		dial, err := getDialer(tlsInfo)
+		if err != nil {
+			return nil, err
+		}
 		d, err := driver.New(nodeStore,
 			driver.WithLogFunc(Logger),
 			driver.WithContext(ctx),
-			driver.WithDialFunc(Dialer))
+			dial)
 		if err != nil {
 			return nil, errors.Wrap(err, "new dqlite driver")
 		}
 		sql.Register(opts.driverName, d)
 	}
 
-	backend, generic, err := sqlite.NewVariant(ctx, opts.driverName, opts.dsn)
+	backend, generic, err := sqlite.NewVariant(ctx, opts.driverName, opts.dsn, connPoolConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "sqlite client")
 	}
@@ -121,7 +132,77 @@ func New(ctx context.Context, datasourceName string) (server.Backend, error) {
 		return err
 	}
 
+	generic.CheckLeader = func(ctx context.Context) bool {
+		dial, err := dialer(tlsInfo)
+
+		if err != nil {
+			return false
+		}
+
+		cli, err := client.FindLeader(ctx, nodeStore, client.WithDialFunc(dial))
+
+		if err != nil {
+			logrus.Errorf("not a leader %v", err)
+			return false
+		}
+
+		leader, err := cli.Leader(ctx)
+		leaderIp := leader.Address
+		logrus.Errorf("Leader address is %s", leaderIp)
+
+		if strings.HasPrefix(leaderIp, "127.0.0.1") {
+			return true
+		}
+
+		addresses, _ := net.InterfaceAddrs()
+
+		for _, address := range addresses {
+			logrus.Errorf("Interface addresses Node IP is %s: ", address.String())
+			if strings.HasPrefix(leaderIp, address.String()) {
+				return true
+			}
+		}
+		logrus.Errorf("I am not a leader")
+		return false
+
+	}
+
 	return backend, nil
+}
+
+func dialer(tlsInfo tls.Config) (client.DialFunc, error) {
+	dial := client.DefaultDialFunc
+	if (tlsInfo.CertFile != "" && tlsInfo.KeyFile == "") || (tlsInfo.KeyFile != "" && tlsInfo.CertFile == "") {
+		return nil, errors.New("both TLS certificate and key must be given")
+	}
+	if tlsInfo.CertFile != "" {
+		cert, err := crypto_tls.LoadX509KeyPair(tlsInfo.CertFile, tlsInfo.KeyFile)
+		if err != nil {
+			return nil, errors.New("bad certificate pair")
+		}
+
+		data, err := ioutil.ReadFile(tlsInfo.CertFile)
+		if err != nil {
+			return nil, errors.New("could not read certificate")
+		}
+
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			return nil, errors.New("bad certificate")
+		}
+
+		config := app.SimpleDialTLSConfig(cert, pool)
+		dial = client.DialFuncWithTLS(dial, config)
+	}
+	return dial, nil
+}
+
+func getDialer(tlsInfo tls.Config) (driver.Option, error) {
+	dialer, err := dialer(tlsInfo)
+	if err != nil {
+		return nil, errors.New("unable to get dialer function")
+	}
+	return driver.WithDialFunc(dialer), nil
 }
 
 func migrate(ctx context.Context, newDB *sql.DB) (exitErr error) {
@@ -231,9 +312,6 @@ func parseOpts(dsn string) (opts, error) {
 			delete(values, k)
 		case "peer-file":
 			result.peerFile = vs[0]
-			delete(values, k)
-		case "driver-name":
-			result.driverName = vs[0]
 			delete(values, k)
 		}
 	}

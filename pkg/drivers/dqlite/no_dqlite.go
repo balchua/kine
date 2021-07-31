@@ -4,11 +4,13 @@ package dqlite
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
-	"github.com/rancher/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/drivers/generic"
+	"github.com/k3s-io/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/tls"
 )
 
-func New(ctx context.Context, datasourceName string) (server.Backend, error) {
-	return nil, fmt.Errorf("dqlite is not support, compile with \"-tags dqlite\"")
+func New(ctx context.Context, datasourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig) (server.Backend, error) {
+	return nil, errors.New(`this binary is built without dqlite support, compile with "-tags dqlite"`)
 }

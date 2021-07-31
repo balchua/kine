@@ -10,38 +10,42 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Rican7/retry/jitter"
+	"github.com/Rican7/retry/backoff"
+	"github.com/Rican7/retry/strategy"
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	defaultMaxIdleConns = 2 // copied from database/sql
+)
+
 var (
-	columns = "kv.id as theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value"
+	columns = "kv.id AS theid, kv.name, kv.created, kv.deleted, kv.create_revision, kv.prev_revision, kv.lease, kv.value, kv.old_value"
 	revSQL  = `
-		SELECT rkv.id
-		FROM kine rkv
-		ORDER BY rkv.id
-		DESC LIMIT 1`
+		SELECT MAX(rkv.id) AS id
+		FROM kine AS rkv`
 
 	compactRevSQL = `
-		SELECT crkv.prev_revision
-		FROM kine crkv
-		WHERE crkv.name = 'compact_rev_key'
-		ORDER BY crkv.id DESC LIMIT 1`
+		SELECT MAX(crkv.prev_revision) AS prev_revision
+		FROM kine AS crkv
+		WHERE crkv.name = 'compact_rev_key'`
 
 	idOfKey = `
-		AND mkv.id <= ? AND mkv.id > (
-			SELECT ikv.id
-			FROM kine ikv
+		AND
+		mkv.id <= ? AND
+		mkv.id > (
+			SELECT MAX(ikv.id) AS id
+			FROM kine AS ikv
 			WHERE
 				ikv.name = ? AND
-				ikv.id <= ?
-			ORDER BY ikv.id DESC LIMIT 1)`
+				ikv.id <= ?)`
 
-	listSQL = fmt.Sprintf(`SELECT (%s), (%s), %s
-		FROM kine kv
+	listSQL = fmt.Sprintf(`
+		SELECT (%s), (%s), %s
+		FROM kine AS kv
 		JOIN (
-			SELECT MAX(mkv.id) as id
-			FROM kine mkv
+			SELECT MAX(mkv.id) AS id
+			FROM kine AS mkv
 			WHERE
 				mkv.name LIKE ?
 				%%s
@@ -62,6 +66,13 @@ func (s Stripped) String() string {
 
 type ErrRetry func(error) bool
 type TranslateErr func(error) error
+type CheckLeader func(context.Context) bool
+
+type ConnectionPoolConfig struct {
+	MaxIdle     int           // zero means defaultMaxIdleConns; negative means 0
+	MaxOpen     int           // <= 0 means unlimited
+	MaxLifetime time.Duration // maximum amount of time a connection may be reused
+}
 
 type Generic struct {
 	sync.Mutex
@@ -77,18 +88,14 @@ type Generic struct {
 	CountSQL              string
 	AfterSQL              string
 	DeleteSQL             string
+	CompactSQL            string
 	UpdateCompactSQL      string
 	InsertSQL             string
 	FillSQL               string
 	InsertLastInsertIDSQL string
 	Retry                 ErrRetry
 	TranslateErr          TranslateErr
-}
-
-func configureConnectionPooling(db *sql.DB) {
-	db.SetMaxIdleConns(5)
-	db.SetMaxOpenConns(5)
-	db.SetConnMaxLifetime(60 * time.Second)
+	CheckLeader           CheckLeader
 }
 
 func q(sql, param string, numbered bool) string {
@@ -129,6 +136,20 @@ func (d *Generic) Migrate(ctx context.Context) {
 	}
 }
 
+func configureConnectionPooling(connPoolConfig ConnectionPoolConfig, db *sql.DB, driverName string) {
+	// behavior copied from database/sql - zero means defaultMaxIdleConns; negative means 0
+	if connPoolConfig.MaxIdle < 0 {
+		connPoolConfig.MaxIdle = 0
+	} else if connPoolConfig.MaxIdle == 0 {
+		connPoolConfig.MaxIdle = defaultMaxIdleConns
+	}
+
+	logrus.Infof("Configuring %s database connection pooling: maxIdleConns=%d, maxOpenConns=%d, connMaxLifetime=%s", driverName, connPoolConfig.MaxIdle, connPoolConfig.MaxOpen, connPoolConfig.MaxLifetime)
+	db.SetMaxIdleConns(connPoolConfig.MaxIdle)
+	db.SetMaxOpenConns(connPoolConfig.MaxOpen)
+	db.SetConnMaxLifetime(connPoolConfig.MaxLifetime)
+}
+
 func openAndTest(driverName, dataSourceName string) (*sql.DB, error) {
 	db, err := sql.Open(driverName, dataSourceName)
 	if err != nil {
@@ -145,7 +166,7 @@ func openAndTest(driverName, dataSourceName string) (*sql.DB, error) {
 	return db, nil
 }
 
-func Open(ctx context.Context, driverName, dataSourceName string, paramCharacter string, numbered bool) (*Generic, error) {
+func Open(ctx context.Context, driverName, dataSourceName string, connPoolConfig ConnectionPoolConfig, paramCharacter string, numbered bool) (*Generic, error) {
 	var (
 		db  *sql.DB
 		err error
@@ -165,7 +186,7 @@ func Open(ctx context.Context, driverName, dataSourceName string, paramCharacter
 		}
 	}
 
-	configureConnectionPooling(db)
+	configureConnectionPooling(connPoolConfig, db, driverName)
 
 	return &Generic{
 		DB: db,
@@ -173,7 +194,7 @@ func Open(ctx context.Context, driverName, dataSourceName string, paramCharacter
 		GetRevisionSQL: q(fmt.Sprintf(`
 			SELECT
 			0, 0, %s
-			FROM kine kv
+			FROM kine AS kv
 			WHERE kv.id = ?`, columns), paramCharacter, numbered),
 
 		GetCurrentSQL:        q(fmt.Sprintf(listSQL, ""), paramCharacter, numbered),
@@ -188,15 +209,15 @@ func Open(ctx context.Context, driverName, dataSourceName string, paramCharacter
 
 		AfterSQL: q(fmt.Sprintf(`
 			SELECT (%s), (%s), %s
-			FROM kine kv
+			FROM kine AS kv
 			WHERE
 				kv.name LIKE ? AND
 				kv.id > ?
 			ORDER BY kv.id ASC`, revSQL, compactRevSQL, columns), paramCharacter, numbered),
 
 		DeleteSQL: q(`
-			DELETE FROM kine
-			WHERE id = ?`, paramCharacter, numbered),
+			DELETE FROM kine AS kv
+			WHERE kv.id = ?`, paramCharacter, numbered),
 
 		UpdateCompactSQL: q(`
 			UPDATE kine
@@ -215,73 +236,51 @@ func Open(ctx context.Context, driverName, dataSourceName string, paramCharacter
 }
 
 func (d *Generic) query(ctx context.Context, sql string, args ...interface{}) (rows *sql.Rows, err error) {
-	i := uint(0)
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("query (try: %d): %w", i, err)
-		}
-	}()
-	for ; i < 500; i++ {
-		if i > 2 {
-			logrus.Debugf("QUERY (try: %d) %v : %s", i, args, Stripped(sql))
-		} else {
-			logrus.Tracef("QUERY (try: %d) %v : %s", i, args, Stripped(sql))
-		}
+	wait := strategy.Backoff(backoff.Linear(6 * time.Millisecond))
+	for i := uint(0); i < 20; i++ {
+		logrus.Tracef("QUERY %v : %s", args, Stripped(sql))
 		rows, err = d.DB.QueryContext(ctx, sql, args...)
 		if err != nil && d.Retry != nil && d.Retry(err) {
-			time.Sleep(jitter.Deviation(nil, 0.3)(2 * time.Millisecond))
+			wait(i)
 			continue
 		}
 		return rows, err
 	}
-	return
+
+	return nil, err
 }
 
-func (d *Generic) queryInt64(ctx context.Context, sql string, args ...interface{}) (n int64, err error) {
-	i := uint(0)
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("query int64 (try: %d): %w", i, err)
+func (d *Generic) queryInt64(ctx context.Context, query string, args ...interface{}) (res int64, err error) {
+	wait := strategy.Backoff(backoff.Linear(6 * time.Millisecond))
+	for i := uint(0); i < 20; i++ {
+		logrus.Tracef("QUERY ROW %v : %s", args, Stripped(query))
+		row := d.DB.QueryRowContext(ctx, query, args...)
+		err = row.Scan(&res)
+		if err == sql.ErrNoRows {
+			return 0, err
 		}
-	}()
-	for ; i < 500; i++ {
-		if i > 2 {
-			logrus.Debugf("QUERY INT64 (try: %d) %v : %s", i, args, Stripped(sql))
-		} else {
-			logrus.Tracef("QUERY INT64 (try: %d) %v : %s", i, args, Stripped(sql))
-		}
-		row := d.DB.QueryRowContext(ctx, sql, args...)
-		err = row.Scan(&n)
 		if err != nil && d.Retry != nil && d.Retry(err) {
-			time.Sleep(jitter.Deviation(nil, 0.3)(2 * time.Millisecond))
+			wait(i)
 			continue
 		}
-		return n, err
+		return res, err
 	}
-	return
+
+	return 0, err
 }
 
 func (d *Generic) execute(ctx context.Context, sql string, args ...interface{}) (result sql.Result, err error) {
-	i := uint(0)
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("exec (try: %d): %w", i, err)
-		}
-	}()
 	if d.LockWrites {
 		d.Lock()
 		defer d.Unlock()
 	}
 
-	for ; i < 500; i++ {
-		if i > 2 {
-			logrus.Debugf("EXEC (try: %d) %v : %s", i, args, Stripped(sql))
-		} else {
-			logrus.Tracef("EXEC (try: %d) %v : %s", i, args, Stripped(sql))
-		}
+	wait := strategy.Backoff(backoff.Linear(6 * time.Millisecond))
+	for i := uint(0); i < 20; i++ {
+		logrus.Tracef("EXEC (try: %d) %v : %s", i, args, Stripped(sql))
 		result, err = d.DB.ExecContext(ctx, sql, args...)
 		if err != nil && d.Retry != nil && d.Retry(err) {
-			time.Sleep(jitter.Deviation(nil, 0.3)(2 * time.Millisecond))
+			wait(i)
 			continue
 		}
 		return result, err
@@ -298,8 +297,18 @@ func (d *Generic) GetCompactRevision(ctx context.Context) (int64, error) {
 }
 
 func (d *Generic) SetCompactRevision(ctx context.Context, revision int64) error {
+	logrus.Tracef("SETCOMPACTREVISION %v", revision)
 	_, err := d.execute(ctx, d.UpdateCompactSQL, revision)
 	return err
+}
+
+func (d *Generic) Compact(ctx context.Context, revision int64) (int64, error) {
+	logrus.Tracef("COMPACT %v", revision)
+	res, err := d.execute(ctx, d.CompactSQL, revision, revision)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (d *Generic) GetRevision(ctx context.Context, revision int64) (*sql.Rows, error) {
@@ -307,6 +316,7 @@ func (d *Generic) GetRevision(ctx context.Context, revision int64) (*sql.Rows, e
 }
 
 func (d *Generic) DeleteRevision(ctx context.Context, revision int64) error {
+	logrus.Tracef("DELETEREVISION %v", revision)
 	_, err := d.execute(ctx, d.DeleteSQL, revision)
 	return err
 }
@@ -332,6 +342,7 @@ func (d *Generic) List(ctx context.Context, prefix, startKey string, limit, revi
 	if limit > 0 {
 		sql = fmt.Sprintf("%s LIMIT %d", sql, limit)
 	}
+	logrus.Tracef("In List sql -> %s , prefix -> %s, revision -> %d, startKey -> %s, revision -> %d", sql, prefix, revision, startKey, revision)
 	return d.query(ctx, sql, prefix, revision, startKey, revision, includeDeleted)
 }
 
@@ -340,25 +351,18 @@ func (d *Generic) Count(ctx context.Context, prefix string) (int64, int64, error
 		rev sql.NullInt64
 		id  int64
 		err error
-		i   uint
 	)
 
-	for ; i < 500; i++ {
-		if i > 0 {
-			logrus.Debugf("COUNT (try: %d) : %s", i, prefix)
-		} else {
-			logrus.Tracef("COUNT (try: %d) : %s", i, prefix)
-		}
+	wait := strategy.Backoff(backoff.Linear(6 * time.Millisecond))
+	for i := uint(0); i < 20; i++ {
+		logrus.Tracef("COUNT (try: %d) : %s", i, prefix)
 		row := d.DB.QueryRowContext(ctx, d.CountSQL, prefix, false)
 		err = row.Scan(&rev, &id)
 		if err != nil && d.Retry != nil && d.Retry(err) {
-			time.Sleep(jitter.Deviation(nil, 0.3)(2 * time.Millisecond))
+			wait(i)
 			continue
 		}
 		break
-	}
-	if err != nil {
-		err = fmt.Errorf("count %s (try: %d): %w", prefix, i, err)
 	}
 	return rev.Int64, id, err
 }
@@ -414,6 +418,9 @@ func (d *Generic) Insert(ctx context.Context, key string, create, delete bool, c
 		return row.LastInsertId()
 	}
 
-	id, err = d.queryInt64(ctx, d.InsertSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue)
-	return id, err
+	return d.queryInt64(ctx, d.InsertSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue)
+}
+
+func (d *Generic) IsLeader(ctx context.Context) bool {
+	return d.CheckLeader(ctx)
 }
