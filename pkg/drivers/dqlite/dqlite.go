@@ -157,9 +157,13 @@ func New(ctx context.Context, datasourceName string, tlsInfo tls.Config, connPoo
 		addresses, _ := net.InterfaceAddrs()
 
 		for _, address := range addresses {
-			logrus.Debugf("Interface addresses Node IP is %s: ", address.String())
-			if strings.HasPrefix(leaderIp, address.String()) {
-				return true
+
+			// check the address type and if it is not a loopback the display it
+			if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				logrus.Debugf("Interface address node IP is %s", ipnet.IP.String())
+				if strings.HasPrefix(leaderIp, ipnet.IP.String()) {
+					return true
+				}
 			}
 		}
 		logrus.Debugf("not a leader")
