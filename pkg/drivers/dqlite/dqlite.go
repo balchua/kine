@@ -157,7 +157,6 @@ func New(ctx context.Context, datasourceName string, tlsInfo tls.Config, connPoo
 		addresses, _ := net.InterfaceAddrs()
 
 		for _, address := range addresses {
-
 			// check the address type and if it is not a loopback the display it
 			if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 				logrus.Debugf("Interface address node IP is %s", ipnet.IP.String())
