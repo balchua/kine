@@ -138,11 +138,11 @@ outer:
 		}
 
 		if !s.d.IsLeader(s.ctx) {
-			logrus.Errorf("######## Compactor Not a leader #######")
+			logrus.Debugf("Not performing compaction because I am not the leader")
 			continue
 		}
 
-		logrus.Errorf("############## Compactor continuing as I am the leader. ##############")
+		logrus.Debugf("Performing compaction because I am the leader")
 		// Break up the compaction into smaller batches to avoid locking the database with excessively
 		// long transactions. When things are working normally deletes should proceed quite quickly, but if
 		// run against a database where compaction has stalled (see rancher/k3s#1311) it may take a long time
@@ -416,10 +416,10 @@ func (s *SQLLog) poll(result chan interface{}, pollStart int64) {
 		waitForMore = true
 
 		if !s.d.IsLeader(s.ctx) {
-			logrus.Errorf("######## Watcher - Not a leader #######")
+			logrus.Debugf("Not performing watch because I am not the leader")
 			continue
 		}
-		logrus.Errorf("######## Watcher - Continuing because I am a leader #######")
+		logrus.Debugf("Performing watch because I am the leader")
 		rows, err := s.d.After(s.ctx, "%", last, 500)
 		if err != nil {
 			logrus.Errorf("fail to list latest changes: %v", err)

@@ -142,13 +142,13 @@ func New(ctx context.Context, datasourceName string, tlsInfo tls.Config, connPoo
 		cli, err := client.FindLeader(ctx, nodeStore, client.WithDialFunc(dial))
 
 		if err != nil {
-			logrus.Errorf("not a leader %v", err)
+			logrus.Debugf("unable to find the leader. %v", err)
 			return false
 		}
 
 		leader, err := cli.Leader(ctx)
 		leaderIp := leader.Address
-		logrus.Errorf("Leader address is %s", leaderIp)
+		logrus.Debugf("Current leader address is %s", leaderIp)
 
 		if strings.HasPrefix(leaderIp, "127.0.0.1") {
 			return true
@@ -157,12 +157,12 @@ func New(ctx context.Context, datasourceName string, tlsInfo tls.Config, connPoo
 		addresses, _ := net.InterfaceAddrs()
 
 		for _, address := range addresses {
-			logrus.Errorf("Interface addresses Node IP is %s: ", address.String())
+			logrus.Debugf("Interface addresses Node IP is %s: ", address.String())
 			if strings.HasPrefix(leaderIp, address.String()) {
 				return true
 			}
 		}
-		logrus.Errorf("I am not a leader")
+		logrus.Debugf("not a leader")
 		return false
 
 	}
